@@ -1,0 +1,4 @@
+flavor=js
+mangled=true
+output_bytes=74
+code=function boot(e){return{message:`hello`,answer:e}}window.runtime=boot(42);

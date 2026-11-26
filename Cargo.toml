@@ -1,0 +1,65 @@
+[package]
+name = "rs-js"
+description = "Pure-Rust JavaScript and TypeScript parser, normalizer, minifier, and CSP analyzer built on Oxc"
+readme = "README.md"
+repository = "https://github.com/codixor/rs-js"
+autobins = false
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT OR Apache-2.0"
+publish = ["crates-io"]
+include = [
+    "/src/**", "/tests/**", "/examples/**", "/benches/**", "/assets/**",
+    "/scripts/validate.sh", "/README.md", "/LICENSE-*", "/THIRD-PARTY-NOTICES.md",
+    "/Cargo.toml", "/Cargo.lock",
+]
+keywords = ["javascript", "typescript", "minify", "obfuscate", "oxc"]
+categories = ["compilers", "command-line-utilities", "development-tools"]
+
+[lib]
+name = "rs_js"
+path = "src/lib.rs"
+
+[dependencies]
+oxc = { version = "=0.128.0", features = ["codegen", "semantic", "mangler", "minifier"] }
+oxc_traverse = "=0.128.0"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "html_reports", "plotters"] }
+
+[[bench]]
+name = "pipeline_core"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = "symbols"
+panic = "unwind"
+incremental = false
+overflow-checks = false
+
+[profile.min-size]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+
+[profile.release-debuginfo]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+split-debuginfo = "packed"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

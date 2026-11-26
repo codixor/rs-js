@@ -1,0 +1,7 @@
+flavor=js
+mangled=false
+contains_eval=false
+contains_function_ctor=false
+input_bytes=128
+output_bytes=72
+code=function boot(){return{message:`hello`,answer:42}}window.runtime=boot();

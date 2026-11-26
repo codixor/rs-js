@@ -1,0 +1,11 @@
+contains_import=false
+contains_export=false
+output_len=37
+code=
+
+
+function boot() {
+  return 42;
+}
+
+

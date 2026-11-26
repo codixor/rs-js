@@ -1,0 +1,11 @@
+file=runtime.mjs
+fingerprint=18e909a8156a7b35
+bindings=1
+functions=1
+exports=1
+direct_eval_calls=1
+indirect_eval_calls=0
+string_timer_callbacks=1
+debugger_statements=1
+warning_count=4
+warnings=direct eval detected; strict CSP will reject this unless unsafe-eval is enabled | string timer callback detected; strict CSP will reject this unless unsafe-eval is enabled | debugger statement detected in input | exports detected; public surface names should be validated in integration tests

@@ -1,0 +1,5 @@
+flavor=mjs
+mangled=false
+input_bytes=103
+output_bytes=69
+code=function boot(){return{label:`hello`,value:42}}window.runtime=boot();

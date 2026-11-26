@@ -1,0 +1,7 @@
+flavor=js
+input_bytes=8924
+output_bytes=6371
+mangled=false
+warning_count=0
+strict_csp_safe=true
+output_hash=2e57296e8e70898f
