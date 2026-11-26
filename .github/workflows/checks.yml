@@ -26,6 +26,8 @@ jobs:
       - run: cargo fmt --all --check && cargo fmt --manifest-path fuzz/Cargo.toml --check
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo nextest run --locked --workspace --all-features
+      - name: Check lazy bundling with Bun
+        run: mise exec bun@1.4.4 -- cargo test --locked --test lazy_bundle -- --ignored
       - run: cargo test --locked --workspace --all-features --doc
       - run: cargo check --locked --workspace --all-features --benches
       - run: cargo package --locked --workspace
