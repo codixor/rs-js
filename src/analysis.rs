@@ -5,11 +5,12 @@ use std::{
 };
 
 use oxc::ast::ast::{
-    BindingIdentifier, CallExpression, Class, DebuggerStatement, ExportAllDeclaration,
-    ExportDefaultDeclaration, ExportNamedDeclaration, Function, IdentifierReference,
-    ImportDeclaration, ImportExpression, JSXElement, JSXFragment, NumericLiteral,
-    PrivateIdentifier, StringLiteral, WithStatement,
+    Argument, ArrowFunctionExpression, BindingIdentifier, CallExpression, Class, DebuggerStatement,
+    ExportAllDeclaration, ExportDefaultDeclaration, ExportNamedDeclaration, Expression, Function,
+    IdentifierReference, ImportDeclaration, ImportExpression, JSXElement, JSXFragment,
+    NewExpression, NumericLiteral, PrivateIdentifier, StringLiteral, WithStatement,
 };
+use oxc::semantic::{IsGlobalReference, Scoping};
 use oxc_traverse::{Traverse, TraverseCtx};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -144,9 +145,7 @@ pub struct Analyzer {
 
 impl Analyzer {
     #[must_use]
-    pub fn finish(mut self, file: &Path, source_text: &str) -> AnalysisReport {
-        self.scan_source_text(source_text);
-
+    pub fn finish(self, file: &Path, _source_text: &str) -> AnalysisReport {
         let fingerprint = {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             self.bindings.hash(&mut hasher);
@@ -194,64 +193,34 @@ impl Analyzer {
         }
     }
 
-    fn scan_source_text(&mut self, source_text: &str) {
-        let indirect_eval_hits = count_any(
-            source_text,
-            &[
-                "(0, eval)(",
-                "(0,eval)(",
-                "window.eval(",
-                "globalThis.eval(",
-                "self.eval(",
-                "global.eval(",
-                "eval.call(",
-                "eval.apply(",
-            ],
-        );
-        if indirect_eval_hits > 0 {
-            self.indirect_eval_calls += indirect_eval_hits;
-            self.risk_flags.insert(RiskFlag::IndirectEval);
-        }
-
-        let function_hits = count_any(
-            source_text,
-            &[
-                "new Function(",
-                "new Function ",
-                "Function(",
-                "AsyncFunction(",
-                "GeneratorFunction(",
-                "AsyncGeneratorFunction(",
-            ],
-        );
-        if function_hits > 0 {
-            self.function_constructor_uses += function_hits;
-            self.risk_flags.insert(RiskFlag::FunctionConstructor);
-        }
-
-        let string_timer_hits = count_any(
-            source_text,
-            &[
-                "setTimeout(\"",
-                "setTimeout('",
-                "setInterval(\"",
-                "setInterval('",
-                "setImmediate(\"",
-                "setImmediate('",
-            ],
-        );
-        if string_timer_hits > 0 {
-            self.string_timer_callbacks += string_timer_hits;
-            self.risk_flags.insert(RiskFlag::StringTimerCallback);
-        }
+    fn record_constructor(&mut self) {
+        self.function_constructor_uses += 1;
+        self.risk_flags.insert(RiskFlag::FunctionConstructor);
     }
 }
 
-fn count_any(haystack: &str, needles: &[&str]) -> u64 {
-    needles
-        .iter()
-        .map(|needle| haystack.match_indices(needle).count() as u64)
-        .sum()
+fn global_name<'a>(expr: &Expression<'a>, scoping: &Scoping) -> Option<&'a str> {
+    if let Some(id) = expr.get_identifier_reference() {
+        return id.is_global_reference(scoping).then(|| id.name.as_str());
+    }
+    let member = expr.get_member_expr()?;
+    let object = member.object().get_identifier_reference()?;
+    if object.is_global_reference(scoping)
+        && matches!(
+            object.name.as_str(),
+            "globalThis" | "window" | "self" | "global"
+        )
+    {
+        return member.static_property_name();
+    }
+    None
+}
+
+fn is_function_constructor(name: &str) -> bool {
+    matches!(
+        name,
+        "Function" | "AsyncFunction" | "GeneratorFunction" | "AsyncGeneratorFunction"
+    )
 }
 
 impl<'a> Traverse<'a, ()> for Analyzer {
@@ -272,6 +241,14 @@ impl<'a> Traverse<'a, ()> for Analyzer {
     }
 
     fn enter_function(&mut self, _node: &mut Function<'a>, _ctx: &mut TraverseCtx<'a, ()>) {
+        self.functions += 1;
+    }
+
+    fn enter_arrow_function_expression(
+        &mut self,
+        _node: &mut ArrowFunctionExpression<'a>,
+        _ctx: &mut TraverseCtx<'a, ()>,
+    ) {
         self.functions += 1;
     }
 
@@ -360,13 +337,59 @@ impl<'a> Traverse<'a, ()> for Analyzer {
     fn enter_call_expression(
         &mut self,
         node: &mut CallExpression<'a>,
-        _ctx: &mut TraverseCtx<'a, ()>,
+        ctx: &mut TraverseCtx<'a, ()>,
     ) {
-        if let oxc::ast::ast::Expression::Identifier(identifier) = &node.callee
-            && identifier.name.as_str() == "eval"
-        {
-            self.direct_eval_calls += 1;
-            self.risk_flags.insert(RiskFlag::DirectEval);
+        let callee = node.callee.get_inner_expression();
+        let target = if let Expression::SequenceExpression(sequence) = callee {
+            sequence
+                .expressions
+                .last()
+                .expect("a sequence has operands")
+        } else {
+            callee
+        };
+        let scoping = ctx.scoping();
+        match global_name(target, scoping) {
+            Some("eval") if callee.is_identifier_reference() && !node.optional => {
+                self.direct_eval_calls += 1;
+                self.risk_flags.insert(RiskFlag::DirectEval);
+            }
+            Some("eval") => {
+                self.indirect_eval_calls += 1;
+                self.risk_flags.insert(RiskFlag::IndirectEval);
+            }
+            Some(name) if is_function_constructor(name) => self.record_constructor(),
+            Some("setTimeout" | "setInterval" | "setImmediate")
+                if matches!(
+                    node.arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .map(Expression::get_inner_expression),
+                    Some(Expression::StringLiteral(_) | Expression::TemplateLiteral(_))
+                ) =>
+            {
+                self.string_timer_callbacks += 1;
+                self.risk_flags.insert(RiskFlag::StringTimerCallback);
+            }
+            _ => {
+                if let Some(member) = target.get_member_expr()
+                    && matches!(member.static_property_name(), Some("call" | "apply"))
+                    && global_name(member.object(), scoping) == Some("eval")
+                {
+                    self.indirect_eval_calls += 1;
+                    self.risk_flags.insert(RiskFlag::IndirectEval);
+                }
+            }
+        }
+    }
+
+    fn enter_new_expression(
+        &mut self,
+        node: &mut NewExpression<'a>,
+        ctx: &mut TraverseCtx<'a, ()>,
+    ) {
+        if global_name(&node.callee, ctx.scoping()).is_some_and(is_function_constructor) {
+            self.record_constructor();
         }
     }
 

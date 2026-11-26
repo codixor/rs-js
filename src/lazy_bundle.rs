@@ -1,7 +1,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsString;
 use std::fs;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
@@ -28,7 +29,7 @@ impl Binding {
 }
 
 /// Controls how a lazy bundle should be post-processed after `bun` emits JS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum LazyBundleMinifyLevel {
     /// Only bundle/transpile the input with `bun`; do not run the Rust minifier.
     None,
@@ -194,11 +195,37 @@ impl LazyBundleBuilder {
         }
 
         for binding in &self.bindings {
-            if binding_is_fresh(binding, watched_hash)? {
+            validate_input_path(&binding.input_path)?;
+            if let Some(parent) = binding.output_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut stamp = fs::File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(binding.hash_path())?;
+            stamp.lock()?;
+            let mut hasher = DefaultHasher::new();
+            (
+                env!("CARGO_PKG_VERSION"),
+                watched_hash,
+                &binding.input_path,
+                self.minify_level,
+                self.csp_mode,
+            )
+                .hash(&mut hasher);
+            let expected = format!("v2:{:016x}", hasher.finish());
+            let mut stored = String::new();
+            stamp.read_to_string(&mut stored)?;
+            if stored == expected && binding.output_path.is_file() {
                 continue;
             }
 
-            validate_input_path(&binding.input_path)?;
+            // Bun writes the output before post-processing. A failed build must
+            // leave the stamp invalid even if the caller restores the old settings.
+            stamp.set_len(0)?;
+            stamp.rewind()?;
             bundle_with_bun(&binding.input_path, &binding.output_path)?;
 
             let bundled = fs::read_to_string(&binding.output_path)?;
@@ -206,7 +233,7 @@ impl LazyBundleBuilder {
                 self.minify_level
                     .post_process(&binding.output_path, &bundled, self.csp_mode)?;
             fs::write(&binding.output_path, output)?;
-            fs::write(binding.hash_path(), watched_hash.to_string())?;
+            stamp.write_all(expected.as_bytes())?;
         }
 
         Ok(())
@@ -238,15 +265,6 @@ impl LazyBundleBuilder {
     }
 }
 
-fn binding_is_fresh(binding: &Binding, watched_hash: u64) -> Result<bool, LazyBundleError> {
-    let expected = match fs::read_to_string(binding.hash_path()) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    Ok(expected.trim() == watched_hash.to_string())
-}
-
 fn validate_input_path(input_path: &Path) -> Result<(), LazyBundleError> {
     if SourceFlavor::from_path(input_path).is_some() {
         Ok(())
@@ -268,26 +286,19 @@ fn hash_files(files: &[PathBuf]) -> Result<u64, LazyBundleError> {
     let mut hash = DefaultHasher::new();
 
     for file in files {
-        hash.write(file.to_string_lossy().as_bytes());
-        let contents = match fs::read_to_string(file) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+        file.hash(&mut hash);
+        let contents = match fs::read(file) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
-        for line in contents.lines() {
-            hash.write(line.as_bytes());
-            hash.write_u8(b'\n');
-        }
+        contents.hash(&mut hash);
     }
 
     Ok(hash.finish())
 }
 
 fn bundle_with_bun(input_path: &Path, output_path: &Path) -> Result<(), LazyBundleError> {
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     let status = Command::new("bun")
         .arg("build")
         .arg(input_path)
