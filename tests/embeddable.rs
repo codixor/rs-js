@@ -5,6 +5,45 @@ mod support;
 use support::assert_golden;
 
 #[test]
+fn host_can_call_embedded_bindings_after_minification_and_mangling() {
+    use std::{io::ErrorKind, process::Command};
+
+    let source = "export default function boot(input) { return input + 1; }
+                  export class Reader { read() { return 2; } }
+                  export const offset = 39;";
+    for builder in [
+        minify("host.mjs", source).embeddable(),
+        minify("host.mjs", source).embeddable().obfuscate(),
+    ] {
+        let code = builder.code().unwrap();
+        for binding in ["boot", "Reader", "offset"] {
+            assert!(code.contains(binding), "{binding} missing from {code}");
+        }
+        let result = Command::new("node")
+            .arg("-e")
+            .arg(
+                r"
+            const vm = require('node:vm');
+            const host = vm.createContext({});
+            vm.runInContext(process.argv[1], host);
+            if (vm.runInContext('boot(new Reader().read() + offset)', host) !== 42) process.exit(1);
+        ",
+            )
+            .arg(&code)
+            .output();
+        match result {
+            Ok(result) => assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            ),
+            Err(err) if err.kind() == ErrorKind::NotFound => (),
+            Err(err) => panic!("could not run Node: {err}"),
+        }
+    }
+}
+
+#[test]
 fn minify_embeddable_matches_the_production_golden() {
     let source = r#"
 export default function boot() {

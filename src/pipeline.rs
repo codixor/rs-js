@@ -10,8 +10,8 @@ use oxc::{
     mangler::{MangleOptions, Mangler},
     minifier::{CompressOptions, Compressor},
     parser::{ParseOptions, Parser},
-    semantic::{Scoping, SemanticBuilder},
-    span::GetSpan,
+    semantic::{Scoping, Semantic, SemanticBuilder},
+    span::{ContentEq, GetSpan, SourceType},
 };
 use oxc_traverse::traverse_mut;
 
@@ -160,13 +160,12 @@ impl<'a> MinifyBuilder<'a> {
     /// Returns an error if normalization, parsing, semantic analysis, or CSP
     /// validation fails.
     pub fn run(self) -> Result<ProcessedOutput, UiJsError> {
-        let source_path = Path::new(self.source_name);
-        let source_text = if self.normalize_embeddable {
-            normalize_embeddable_source(source_path, self.source_text, self.options.source_flavor)?
-        } else {
-            self.source_text.to_owned()
-        };
-        process_source(source_path, &source_text, &self.options)
+        process(
+            Path::new(self.source_name),
+            self.source_text,
+            &self.options,
+            self.normalize_embeddable,
+        )
     }
 
     /// Runs the configured JS pipeline and returns only the analysis report.
@@ -211,17 +210,45 @@ pub fn process_source(
     source_text: &str,
     options: &ObfuscatorOptions,
 ) -> Result<ProcessedOutput, UiJsError> {
+    process(source_path, source_text, options, false)
+}
+
+fn process(
+    source_path: &Path,
+    source_text: &str,
+    options: &ObfuscatorOptions,
+    embeddable: bool,
+) -> Result<ProcessedOutput, UiJsError> {
     let allocator = Allocator::default();
     let source_flavor = options.source_flavor_for_path(source_path)?;
-    let source_type = source_flavor.to_source_type();
-    let mut program = parse_program(
-        &allocator,
-        source_path,
-        source_text,
-        source_type,
-        options.parse_regular_expression,
-    )?;
-    let scoping = build_scoping(source_path, &program)?;
+    let normalized;
+    let (mut program, scoping) = if embeddable {
+        let source_type;
+        (normalized, source_type) = rewrite_embeddable_source(
+            source_path,
+            source_text,
+            source_flavor,
+            options.parse_regular_expression,
+        )?;
+        parse_embeddable_script(
+            &allocator,
+            source_path,
+            &normalized,
+            source_type,
+            options.parse_regular_expression,
+        )?
+    } else {
+        let program = parse_program(
+            &allocator,
+            source_path,
+            source_text,
+            source_flavor.to_source_type(),
+            options.parse_regular_expression,
+        )?;
+        let scoping = build_semantic(source_path, &program)?.into_scoping();
+        (program, scoping)
+    };
+    let source_text = program.source_text;
     let report = analyze_program(&allocator, source_path, source_text, &mut program, scoping);
     enforce_csp_mode(source_path, &report, options.csp_mode)?;
     let input_bytes = source_text.len();
@@ -341,7 +368,11 @@ pub fn minify_javascript(
 /// Returns an error if the input cannot be parsed or contains unsupported
 /// embeddable module syntax.
 pub fn normalize_embeddable(source_name: &str, source_text: &str) -> Result<String, UiJsError> {
-    normalize_embeddable_source(Path::new(source_name), source_text, None)
+    let path = Path::new(source_name);
+    let flavor = SourceFlavor::from_path(path).unwrap_or(SourceFlavor::Mjs);
+    let (normalized, source_type) = rewrite_embeddable_source(path, source_text, flavor, true)?;
+    parse_embeddable_script(&Allocator::default(), path, &normalized, source_type, true)?;
+    Ok(normalized)
 }
 
 /// Normalizes embeddable JavaScript module syntax into a plain source string.
@@ -386,17 +417,21 @@ pub fn minify_embeddable_javascript(
         .run()
 }
 
-fn normalize_embeddable_source(
+fn rewrite_embeddable_source(
     source_path: &Path,
     source_text: &str,
-    source_flavor: Option<SourceFlavor>,
-) -> Result<String, UiJsError> {
+    source_flavor: SourceFlavor,
+    parse_regular_expression: bool,
+) -> Result<(String, SourceType), UiJsError> {
     let allocator = Allocator::default();
-    let source_type = source_flavor
-        .unwrap_or_else(|| embeddable_source_flavor(source_path))
-        .to_source_type();
 
-    let program = parse_program(&allocator, source_path, source_text, source_type, true)?;
+    let program = parse_program(
+        &allocator,
+        source_path,
+        source_text,
+        source_flavor.to_source_type(),
+        parse_regular_expression,
+    )?;
     let mut edits = Vec::new();
     let mut reasons = Vec::new();
 
@@ -442,17 +477,58 @@ fn normalize_embeddable_source(
         });
     }
 
-    apply_text_edits(source_text, edits.as_mut_slice())
+    build_semantic(source_path, &program)?;
+    Ok((
+        apply_text_edits(source_text, edits.as_mut_slice())?,
+        program.source_type,
+    ))
 }
 
-fn embeddable_source_flavor(source_path: &Path) -> SourceFlavor {
-    match source_path.extension().and_then(|value| value.to_str()) {
-        Some("ts") => SourceFlavor::Ts,
-        Some("tsx") => SourceFlavor::Tsx,
-        Some("jsx") => SourceFlavor::Jsx,
-        Some("cjs") => SourceFlavor::Cjs,
-        _ => SourceFlavor::Mjs,
+fn parse_embeddable_script<'a>(
+    allocator: &'a Allocator,
+    source_path: &Path,
+    source_text: &'a str,
+    source_type: SourceType,
+    parse_regular_expression: bool,
+) -> Result<(Program<'a>, Scoping), UiJsError> {
+    let unsupported = |err: UiJsError| UiJsError::UnsupportedEmbeddableModuleSyntax {
+        file: source_path.to_path_buf(),
+        reasons: err
+            .diagnostics()
+            .iter()
+            .map(JsDiagnostic::summary_line)
+            .collect(),
+    };
+    let program = parse_program(
+        allocator,
+        source_path,
+        source_text,
+        SourceType::script(),
+        parse_regular_expression,
+    )
+    .map_err(unsupported)?;
+    let scoping = build_semantic(source_path, &program)
+        .map_err(unsupported)?
+        .into_scoping();
+    // Both goals can parse the same text differently: e.g. module `await(x)`
+    // or a TypeScript generic call `f<T>(x)`. Compare the normalized bodies.
+    if !(source_type.is_script() && source_type.is_javascript() && !source_type.is_jsx()) {
+        let original = parse_program(
+            allocator,
+            source_path,
+            source_text,
+            source_type,
+            parse_regular_expression,
+        )
+        .map_err(unsupported)?;
+        if original.body.content_ne(&program.body) {
+            return Err(UiJsError::UnsupportedEmbeddableModuleSyntax {
+                file: source_path.to_path_buf(),
+                reasons: vec!["normalized source has a different meaning in classic JavaScript script grammar".to_owned()],
+            });
+        }
     }
+    Ok((program, scoping))
 }
 
 fn classify_import(
@@ -647,8 +723,12 @@ fn parse_program<'a>(
     Ok(parser_return.program)
 }
 
-fn build_scoping(source_path: &Path, program: &Program<'_>) -> Result<Scoping, UiJsError> {
+fn build_semantic<'a>(
+    source_path: &Path,
+    program: &'a Program<'a>,
+) -> Result<Semantic<'a>, UiJsError> {
     let semantic_return = SemanticBuilder::new()
+        .with_check_syntax_error(true)
         .with_excess_capacity(0.10)
         .build(program);
 
@@ -664,7 +744,7 @@ fn build_scoping(source_path: &Path, program: &Program<'_>) -> Result<Scoping, U
         });
     }
 
-    Ok(semantic_return.semantic.into_scoping())
+    Ok(semantic_return.semantic)
 }
 
 fn analyze_program<'a>(
