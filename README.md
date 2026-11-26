@@ -43,12 +43,12 @@ fn main() -> Result<(), JsError> {
 }
 ```
 
-The report includes syntax counts, a fingerprint of the counts and flags, and warnings about features such as dynamic imports, `debugger`, and `with`. CSP detection uses syntax and text patterns, so review findings in context and enforce the actual policy in the browser. Parse and semantic errors carry structured diagnostics with messages, severity and byte-range labels.
+The report includes syntax counts, a fingerprint of the counts and flags, and warnings about features such as dynamic imports, `debugger`, and `with`. CSP detection checks recognized calls and constructors in the parsed syntax tree. Parse and semantic errors carry structured diagnostics with messages, severity and byte-range labels.
 
 ## Transformations
 
 - `.obfuscate()` enables identifier mangling. Dynamic-scope patterns can change name resolution at runtime, so the pipeline skips mangling for these inputs and records the finding. `.allow_risky_mangle()` overrides that decision.
-- `.embeddable()` removes type-only import/export declarations and rewrites supported exports into local declarations before minifying. Value imports, value re-exports, anonymous default exports and TypeScript export assignments are among the forms that return `JsError::UnsupportedEmbeddableModuleSyntax`. Call `normalize_embeddable` for just the normalization step.
+- `.embeddable()` removes type-only import/export declarations and rewrites supported exports into declarations that the embedding host can use by name. The normalized code must parse as a classic JavaScript script. Value imports, value re-exports, anonymous default exports, `import.meta` and top-level `await` are among the forms that return `JsError::UnsupportedEmbeddableModuleSyntax`. Call `normalize_embeddable` for just the normalization step.
 - `process_source` accepts a path and `ObfuscatorOptions` for callers that supply configuration directly. Convenience functions are available in `rs_js::compat`.
 - The optional build-script helper `rs_js::lazy_bundle::LazyBundleBuilder` invokes Bun to bundle and transpile assets and can post-process the result with the Rust minifier. Only callers of this helper need a `bun` executable on their path.
 
